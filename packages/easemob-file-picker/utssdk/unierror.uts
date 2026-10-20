@@ -1,0 +1,16 @@
+import { FilePickerError, FilePickerErrorCode } from './interface.uts'
+export const UniErrorSubject = 'easemob-file-picker'
+export const FilePickerErrors: Map<FilePickerErrorCode, string> = new Map([
+  [9010001, 'File selection failed'],
+  [9010002, 'Unable to open the file picker'],
+  [9010003, 'Permission to access the file was denied'],
+  [9010004, 'The selected URI is invalid or unavailable'],
+  [9010005, 'File metadata is unavailable'],
+  [9010006, 'Unable to read or copy the file'],
+  [9010007, 'Insufficient storage'],
+  [9010008, 'This platform does not support the requested operation']
+])
+export class FilePickerErrorImpl extends UniError implements FilePickerError {
+  override errCode: FilePickerErrorCode
+  constructor(errCode: FilePickerErrorCode, message?: string) { super(); this.errSubject = UniErrorSubject; this.errCode = errCode; this.errMsg = message ?? FilePickerErrors.get(errCode) ?? 'File picker error' }
+}

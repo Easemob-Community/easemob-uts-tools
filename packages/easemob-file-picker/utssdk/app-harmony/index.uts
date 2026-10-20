@@ -1,0 +1,160 @@
+import { ChooseFileOptions, ChooseFileResult, FileInfo, FileInfoOptions, FilePickerErrorCode, PrepareFileOptions, RemoveTempFileOptions, RemoveTempFileResult } from '../interface.uts'
+import { FilePickerErrorImpl } from '../unierror'
+import picker from '@ohos.file.picker'
+import fs from '@ohos.file.fs'
+import uriModule from '@ohos.uri'
+// UTSHarmony 是 uni-app x 鸿蒙端的全局对象，无需 import；import 'io.dcloud.uts' 会解析失败
+
+const fail = (options: ChooseFileOptions | FileInfoOptions | PrepareFileOptions | RemoveTempFileOptions, code: FilePickerErrorCode) : void => {
+  const error = new FilePickerErrorImpl(code)
+  // UTS 联合类型编译后无法直接访问成员（iOS 端已验证会编译失败），先断言为具体类型
+  const opt = options as ChooseFileOptions
+  opt.fail?.(error)
+  opt.complete?.(error)
+}
+
+const extensionOf = (name: string) : string => {
+  const index = name.lastIndexOf('.')
+  return index > 0 && index < name.length - 1 ? name.substring(index + 1).toLowerCase() : ''
+}
+
+const extensionsForMime = (mime: string) : string[] => {
+  const known = new Map<string, string[]>([
+    ['application/pdf', ['.pdf']], ['text/plain', ['.txt', '.text']], ['application/zip', ['.zip']], ['application/json', ['.json']],
+    ['application/msword', ['.doc']], ['application/vnd.openxmlformats-officedocument.wordprocessingml.document', ['.docx']],
+    ['application/vnd.ms-excel', ['.xls']], ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ['.xlsx']],
+    ['application/vnd.ms-powerpoint', ['.ppt']], ['application/vnd.openxmlformats-officedocument.presentationml.presentation', ['.pptx']],
+    ['image/jpeg', ['.jpg', '.jpeg']], ['image/png', ['.png']], ['image/gif', ['.gif']], ['image/webp', ['.webp']],
+    ['audio/mpeg', ['.mp3']], ['audio/mp4', ['.m4a']], ['audio/wav', ['.wav']], ['video/mp4', ['.mp4']], ['video/quicktime', ['.mov']]
+  ])
+  return known.get(mime) ?? []
+}
+
+const nameFromUri = (uri: string) : string => {
+  const encodedName = new uriModule.URI(uri).toString().split('/').pop() ?? 'file'
+  try { return decodeURIComponent(encodedName) } catch (e) { return encodedName }
+}
+
+const queryFileInfo = (uri: string) : FileInfo | null => {
+  try {
+    const descriptor = fs.openSync(uri, fs.OpenMode.READ_ONLY)
+    // 必须显式标注类型，let stat = null 会被 ArkTS 推断为 null 类型导致后续赋值报错
+    let stat: fs.Stat | null = null
+    try { stat = fs.statSync(descriptor.fd) } finally { fs.closeSync(descriptor) }
+    const name = nameFromUri(uri)
+    const extension = extensionOf(name)
+    // ArkTS 的 number 没有 toDouble()，Stat.size 本身就是 number
+    return { uri, name, size: stat!.size, mimeType: UTSHarmony.getMimeTypeFromExtension(extension), extension, path: null, isTemporary: false }
+  } catch (e) { return null }
+}
+
+const temporaryPath = (name: string) : string => {
+  const context = UTSHarmony.getUIAbilityContext()
+  const cacheDir = context.cacheDir
+  const safeExtension = extensionOf(name)
+  const suffix = safeExtension.length > 0 ? '.' + safeExtension : ''
+  return cacheDir + '/easemob-file-' + Date.now().toString() + '-' + Math.floor(Math.random() * 1000000).toString() + suffix
+}
+
+const copyToCache = (uri: string) : FileInfo | null => {
+  const metadata = queryFileInfo(uri)
+  if (metadata == null) return null
+  const target = temporaryPath(metadata!.name)
+  let sourceFd = -1
+  let targetFd = -1
+  try {
+    // picker 授予的临时读权限挂在 fd 上：直接用 URI 调 copyFileSync 会因
+    // URI→沙箱路径转换失败而抛错（如 file://docs/storage/Users/... 其他应用公共目录），
+    // 必须先 openSync 拿 fd，再走 fd 级 copyFileSync
+    const source = fs.openSync(uri, fs.OpenMode.READ_ONLY)
+    sourceFd = source.fd
+    const dest = fs.openSync(target, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE)
+    targetFd = dest.fd
+    fs.copyFileSync(sourceFd, targetFd)
+    const copied = fs.statSync(targetFd)
+    return { uri, name: metadata!.name, size: copied.size, mimeType: metadata!.mimeType, extension: metadata!.extension, path: target, isTemporary: true }
+  } catch (e) {
+    try { fs.unlinkSync(target) } catch (cleanupError) {}
+    return null
+  } finally {
+    if (sourceFd >= 0) { try { fs.closeSync(sourceFd) } catch (closeError) {} }
+    if (targetFd >= 0) { try { fs.closeSync(targetFd) } catch (closeError) {} }
+  }
+}
+
+const getSuffixes = (mimeTypes: string[] | null) : string[] => {
+  if (mimeTypes == null || mimeTypes!.length == 0) return []
+  const extensions: string[] = []
+  for (const mime of mimeTypes!) {
+    if (mime == '*/*' || mime.endsWith('/*')) return []
+    extensions.push(...extensionsForMime(mime))
+  }
+  return extensions
+}
+
+const hasUnsupportedMimeType = (mimeTypes: string[] | null) : boolean => {
+  if (mimeTypes == null || mimeTypes!.length == 0) return false
+  for (const mime of mimeTypes!) {
+    if (mime != '*/*' && !mime.endsWith('/*') && extensionsForMime(mime).length == 0) return true
+  }
+  return false
+}
+
+export const chooseFile = (options: ChooseFileOptions) : void => {
+  if (hasUnsupportedMimeType(options.mimeTypes ?? null)) { fail(options, 9010008); return }
+  try {
+    const documentPicker = new picker.DocumentViewPicker(UTSHarmony.getUIAbilityContext())
+    const selectOptions: picker.DocumentSelectOptions = { maxSelectNumber: options.multiple == true ? 50 : 1, fileSuffixFilters: getSuffixes(options.mimeTypes ?? null) }
+    documentPicker.select(selectOptions).then((uris: string[]) => {
+      if (uris.length == 0) {
+        const result: ChooseFileResult = { files: [], cancelled: true }
+        options.success?.(result)
+        options.complete?.(result)
+        return
+      }
+      const files: FileInfo[] = []
+      for (const uri of uris) {
+        const info = queryFileInfo(uri)
+        if (info != null) files.push(info!)
+      }
+      const result: ChooseFileResult = { files, cancelled: false }
+      options.success?.(result)
+      options.complete?.(result)
+    }).catch((e: Error) => {
+      const message = e.message ?? ''
+      if (message.toLowerCase().includes('cancel')) {
+        const result: ChooseFileResult = { files: [], cancelled: true }
+        options.success?.(result)
+        options.complete?.(result)
+      } else fail(options, 9010002)
+    })
+  } catch (e) { fail(options, 9010002) }
+}
+
+export const getFileInfo = (options: FileInfoOptions) : void => {
+  const info = queryFileInfo(options.uri)
+  if (info == null) { fail(options, 9010004); return }
+  options.success?.(info!)
+  options.complete?.(info!)
+}
+
+export const prepareFile = (options: PrepareFileOptions) : void => {
+  const info = copyToCache(options.uri)
+  if (info == null) { fail(options, 9010006); return }
+  options.success?.(info!)
+  options.complete?.(info!)
+}
+
+export const removeTempFile = (options: RemoveTempFileOptions) : void => {
+  const context = UTSHarmony.getUIAbilityContext()
+  if (context == null) { fail(options, 9010006); return }
+  const cachePrefix = context!.cacheDir + '/easemob-file-'
+  // ArkTS 不支持结构类型推断，对象字面量必须显式标注类型，否则编译成 UTSJSONObject 报错
+  if (!options.path.startsWith(cachePrefix)) { const result: RemoveTempFileResult = { removed: false }; options.success?.(result); options.complete?.(result); return }
+  try {
+    fs.unlinkSync(options.path)
+    const result: RemoveTempFileResult = { removed: true }
+    options.success?.(result)
+    options.complete?.(result)
+  } catch (e) { const result: RemoveTempFileResult = { removed: false }; options.success?.(result); options.complete?.(result) }
+}

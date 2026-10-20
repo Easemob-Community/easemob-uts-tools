@@ -1,0 +1,184 @@
+import { ChooseFileOptions, ChooseFileResult, FileInfo, FileInfoOptions, FilePickerErrorCode, PrepareFileOptions, RemoveTempFileOptions, RemoveTempFileResult } from '../interface.uts'
+import { FilePickerErrorImpl } from '../unierror'
+import { UIDocumentPickerViewController, UIDocumentPickerDelegate } from 'UIKit'
+import { UTType } from 'UniformTypeIdentifiers'
+import { DispatchQueue } from 'Dispatch'
+import { UTSiOS } from 'DCloudUTSFoundation'
+import { NSObject, URL, NSURL, NSString, URLResourceKey, URLResourceValues, FileManager, NSTemporaryDirectory, UUID } from 'Foundation'
+
+const fail = (options: ChooseFileOptions | FileInfoOptions | PrepareFileOptions | RemoveTempFileOptions, code: FilePickerErrorCode) : void => {
+  // iOS 桥接下可选参数未必生成 Swift 默认值，message 显式传 null
+  const error = new FilePickerErrorImpl(code, null)
+  // iOS 下 UTS 联合类型会编译为 UTSUnionTypeObject，无法直接访问成员，需先断言为具体类型
+  const opt = options as ChooseFileOptions
+  opt.fail?.(error)
+  opt.complete?.(error)
+}
+
+// 直接用 NSString.pathExtension，避免 split/pop/强解包在 UTS-iOS 桥接下的问题
+const extensionOf = (name: string) : string => {
+  return (name as NSString).pathExtension.toLowerCase()
+}
+
+// 参数不能命名为 extension（Swift 关键字）
+const mimeForExtension = (ext: string) : string => {
+  if (ext.length == 0) return ''
+  const type = new UTType(filenameExtension = ext, conformingTo = UTType.data)
+  if (type == null) return ''
+  return type!.preferredMIMEType ?? ''
+}
+
+const contentTypesForMimes = (mimeTypes: string[]) : UTType[] => {
+  if (mimeTypes.length == 0) return [UTType.data]
+  const types: UTType[] = []
+  for (const mime of mimeTypes) {
+    if (mime == '*/*') return [UTType.data]
+    if (mime.endsWith('/*')) {
+      // 通配类型映射到 UTType 的预置父类型
+      if (mime == 'image/*') types.push(UTType.image)
+      else if (mime == 'video/*') types.push(UTType.movie)
+      else if (mime == 'audio/*') types.push(UTType.audio)
+      else if (mime == 'text/*') types.push(UTType.text)
+      else return [UTType.data]
+    } else {
+      // iOS 14+ 直接由 MIME 构造 UTType，无需手写 MIME→UTI 映射表
+      const type = new UTType(mimeType = mime, conformingTo = UTType.data)
+      if (type != null) types.push(type!)
+    }
+  }
+  return types.length > 0 ? types : [UTType.data]
+}
+
+const parseURL = (uri: string) : URL | null => {
+  // URL(string:) 单参数写法有官方插件实证；fileURLWithPath 走 NSURL 类方法，避开双参数重载的桥接歧义
+  const fromString = URL(string = uri)
+  if (fromString != null) return fromString
+  return NSURL.fileURL(withPath = uri)
+}
+
+const queryFileInfo = (url: URL, uriText: string) : FileInfo | null => {
+  const accessed = url.startAccessingSecurityScopedResource()
+  try {
+    // resourceValues 对无效/不存在的文件会抛异常，兼作存在性检查，替代 fileExists（其双参数重载有桥接歧义）
+    const values = UTSiOS.try(url.resourceValues(forKeys = [URLResourceKey.fileSizeKey, URLResourceKey.nameKey])) as URLResourceValues
+    // 原生 Int 转 UTS number 需用 new Number() 桥接；?? 避免对可选值强解包
+    const size = new Number(values.fileSize ?? 0)
+    var name = values.name ?? url.lastPathComponent
+    if (name.length == 0) name = 'file'
+    const ext = extensionOf(name)
+    return { uri: uriText, name, size, mimeType: mimeForExtension(ext), extension: ext, path: null, isTemporary: false }
+  } catch (e) {
+    return null
+  } finally {
+    if (accessed) url.stopAccessingSecurityScopedResource()
+  }
+}
+
+class FilePickerDelegate extends NSObject implements UIDocumentPickerDelegate {
+  // Swift 要求属性在 super.init 前完成初始化，UTS 又要求 super() 先于 this——声明处给默认值来同时满足
+  onPick: (urls: URL[]) => void = (urls: URL[]) => {}
+  onCancel: () => void = () => {}
+  constructor(onPick: (urls: URL[]) => void, onCancel: () => void) {
+    super()
+    this.onPick = onPick
+    this.onCancel = onCancel
+  }
+  // Swift 选择器 documentPicker(_:didPickDocumentsAt:)：方法名只写基础名，参数标签用 @argumentLabel 注解
+  documentPicker(controller: UIDocumentPickerViewController, @argumentLabel("didPickDocumentsAt") urls: URL[]) : void {
+    this.onPick(urls)
+  }
+  // 对应 Swift 选择器 documentPickerWasCancelled(_:)
+  documentPickerWasCancelled(controller: UIDocumentPickerViewController) : void {
+    this.onCancel()
+  }
+}
+
+let currentDelegate: FilePickerDelegate | null = null
+
+export const chooseFile = (options: ChooseFileOptions) : void => {
+  if (currentDelegate != null) { fail(options, 9010002); return }
+  // UTS 方法默认在子线程执行，UI 操作必须切主线程
+  DispatchQueue.main.async(execute = (): void => {
+    const controller = UTSiOS.getCurrentViewController()
+    if (controller == null) { fail(options, 9010002); return }
+    // UTS 桥接的是 forOpeningContentTypes:asCopy: 双参数初始化器，asCopy 必须显式传
+    // asCopy=false 保持与 Android 一致的语义：chooseFile 只取元数据，prepareFile 才复制
+    const picker = new UIDocumentPickerViewController(forOpeningContentTypes = contentTypesForMimes(options.mimeTypes ?? []), asCopy = false)
+    picker.allowsMultipleSelection = options.multiple == true
+    const delegate = new FilePickerDelegate(
+      (urls: URL[]) => {
+        currentDelegate = null
+        const files: FileInfo[] = []
+        for (const url of urls) {
+          const info = queryFileInfo(url, url.absoluteString)
+          if (info != null) files.push(info!)
+        }
+        if (files.length == 0) { fail(options, 9010005); return }
+        const result: ChooseFileResult = { files, cancelled: false }
+        options.success?.(result)
+        options.complete?.(result)
+      },
+      () => {
+        currentDelegate = null
+        const result: ChooseFileResult = { files: [], cancelled: true }
+        options.success?.(result)
+        options.complete?.(result)
+      }
+    )
+    // picker.delegate 是弱引用，必须用模块级变量持有，否则回调会丢失
+    currentDelegate = delegate
+    picker.delegate = delegate
+    controller.present(picker, animated = true)
+  })
+}
+
+export const getFileInfo = (options: FileInfoOptions) : void => {
+  const url = parseURL(options.uri)
+  if (url == null) { fail(options, 9010004); return }
+  const info = queryFileInfo(url!, options.uri)
+  if (info == null) { fail(options, 9010004); return }
+  options.success?.(info!)
+  options.complete?.(info!)
+}
+
+export const prepareFile = (options: PrepareFileOptions) : void => {
+  const url = parseURL(options.uri)
+  if (url == null) { fail(options, 9010004); return }
+  const source = url!
+  const metadata = queryFileInfo(source, options.uri)
+  if (metadata == null) { fail(options, 9010004); return }
+  const suffix = metadata!.extension.length > 0 ? '.' + metadata!.extension : ''
+  const destPath = NSTemporaryDirectory() + new UUID().uuidString + suffix
+  const accessed = source.startAccessingSecurityScopedResource()
+  try {
+    UTSiOS.try(FileManager.default.copyItem(at = source, to = NSURL.fileURL(withPath = destPath)))
+  } catch (e) {
+    fail(options, 9010006)
+    return
+  } finally {
+    if (accessed) source.stopAccessingSecurityScopedResource()
+  }
+  const result: FileInfo = { uri: options.uri, name: metadata!.name, size: metadata!.size, mimeType: metadata!.mimeType, extension: metadata!.extension, path: destPath, isTemporary: true }
+  options.success?.(result)
+  options.complete?.(result)
+}
+
+export const removeTempFile = (options: RemoveTempFileOptions) : void => {
+  const tempDir = NSTemporaryDirectory()
+  if (options.path.length == 0 || !options.path.startsWith(tempDir)) {
+    const result: RemoveTempFileResult = { removed: false }
+    options.success?.(result)
+    options.complete?.(result)
+    return
+  }
+  try {
+    UTSiOS.try(FileManager.default.removeItem(atPath = options.path))
+    const result: RemoveTempFileResult = { removed: true }
+    options.success?.(result)
+    options.complete?.(result)
+  } catch (e) {
+    const result: RemoveTempFileResult = { removed: false }
+    options.success?.(result)
+    options.complete?.(result)
+  }
+}

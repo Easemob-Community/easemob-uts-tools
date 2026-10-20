@@ -1,0 +1,168 @@
+import { ChooseFileOptions, ChooseFileResult, FileInfo, FileInfoOptions, FilePickerErrorCode, PrepareFileOptions, RemoveTempFileOptions, RemoveTempFileResult } from '../interface.uts'
+import { FilePickerErrorImpl } from '../unierror'
+// UTS-Android 导入原生类必须用默认导入语法，命名导入会编译成 android.app.Activity.Activity 这种双重路径
+import Intent from 'android.content.Intent'
+import Uri from 'android.net.Uri'
+import OpenableColumns from 'android.provider.OpenableColumns'
+import Cursor from 'android.database.Cursor'
+import Activity from 'android.app.Activity'
+import File from 'java.io.File'
+import FileOutputStream from 'java.io.FileOutputStream'
+import InputStream from 'java.io.InputStream'
+import UUID from 'java.util.UUID'
+import { Long } from 'kotlin'
+
+const REQUEST_CODE = 29174
+let pendingChoose: ChooseFileOptions | null = null
+
+const fail = (options: ChooseFileOptions | FileInfoOptions | PrepareFileOptions | RemoveTempFileOptions, code: FilePickerErrorCode) : void => {
+  // 可选参数 message 在 Kotlin 侧不会生成默认值，必须显式传 null
+  const error = new FilePickerErrorImpl(code, null)
+  // UTS 联合类型编译后无法直接访问成员（iOS 端已验证会编译失败），先断言为具体类型
+  const opt = options as ChooseFileOptions
+  opt.fail?.(error)
+  opt.complete?.(error)
+}
+
+const extensionOf = (name: string) : string => {
+  const index = name.lastIndexOf('.')
+  // substring 的形参是 Kotlin Int，UTS number 需显式 toInt() 桥接
+  return index > 0 && index < name.length - 1 ? name.substring((index + 1).toInt()).toLowerCase() : ''
+}
+
+const queryFileInfo = (uriText: string) : FileInfo | null => {
+  const context = UTSAndroid.getAppContext()
+  if (context == null || uriText.length == 0) return null
+  const uri = Uri.parse(uriText)
+  const resolver = context!.getContentResolver()
+  let name = ''
+  let size = 0
+  let cursor: Cursor | null = null
+  try {
+    // projection 传 null 表示返回全部列，绕开 UTSArray 无法直接桥接为 Java Array<String> 的问题
+    cursor = resolver.query(uri, null, null, null, null)
+    if (cursor != null && cursor!.moveToFirst()) {
+      const nameIndex = cursor!.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+      const sizeIndex = cursor!.getColumnIndex(OpenableColumns.SIZE)
+      if (nameIndex >= 0) name = cursor!.getString(nameIndex) ?? ''
+      if (sizeIndex >= 0 && !cursor!.isNull(sizeIndex)) size = (cursor!.getLong(sizeIndex) as Long).toDouble()
+    }
+  } catch (e) {
+    name = ''
+  } finally {
+    cursor?.close()
+  }
+  if (name.length == 0) name = uri.getLastPathSegment() ?? 'file'
+  // getType 对失效/无权限的 URI 会抛 SecurityException，必须包 try，否则 getFileInfo 会崩溃而不是走 fail 回调
+  let mime = ''
+  try { mime = resolver.getType(uri) ?? '' } catch (e) {}
+  return { uri: uriText, name, size, mimeType: mime, extension: extensionOf(name), path: null, isTemporary: false }
+}
+
+const copyToCache = (uriText: string) : FileInfo | null => {
+  const activity = UTSAndroid.getUniActivity()
+  const context = UTSAndroid.getAppContext()
+  if (activity == null || context == null) return null
+  const source = Uri.parse(uriText)
+  let input: InputStream | null = null
+  let output: FileOutputStream | null = null
+  let outputFile: File | null = null
+  try {
+    input = context!.getContentResolver().openInputStream(source)
+    if (input == null) return null
+    const metadata = queryFileInfo(uriText)
+    if (metadata == null) return null
+    const suffix = metadata!.extension.length > 0 ? '.' + metadata!.extension : ''
+    outputFile = File(context!.getCacheDir(), UUID.randomUUID().toString() + suffix)
+    output = FileOutputStream(outputFile!)
+    const buffer = ByteArray(65536)
+    var count = input!.read(buffer)
+    while (count > 0) { output!.write(buffer, 0, count); count = input!.read(buffer) }
+    output!.flush()
+    return { uri: uriText, name: metadata!.name, size: outputFile!.length().toDouble(), mimeType: metadata!.mimeType, extension: metadata!.extension, path: outputFile!.getAbsolutePath(), isTemporary: true }
+  } catch (e) {
+    if (outputFile != null) outputFile!.delete()
+    return null
+  } finally {
+    try { input?.close() } catch (e) {}
+    try { output?.close() } catch (e) {}
+  }
+}
+
+// 显式标注函数类型：闭包内引用自身（offAppActivityResult）会导致 Kotlin 类型推断递归
+const onActivityResult: (requestCode: number, resultCode: number, data: Intent | null) => void = (requestCode: number, resultCode: number, data: Intent | null) : void => {
+  if (requestCode != REQUEST_CODE || pendingChoose == null) return
+  const options = pendingChoose!
+  pendingChoose = null
+  UTSAndroid.offAppActivityResult(onActivityResult)
+  if (resultCode != Activity.RESULT_OK || data == null) {
+    const result: ChooseFileResult = { files: [], cancelled: true }
+    options.success?.(result)
+    options.complete?.(result)
+    return
+  }
+  const uris: Uri[] = []
+  const clip = data!.getClipData()
+  if (clip != null) {
+    for (let i = 0; i < clip!.getItemCount(); i++) { const item = clip!.getItemAt(i.toInt()); const itemUri = item?.getUri(); if (itemUri != null) uris.push(itemUri!) }
+  } else {
+    const uri = data!.getData()
+    if (uri != null) uris.push(uri!)
+  }
+  const flags = data!.getFlags()
+  if ((flags & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0 && (flags & Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0) {
+    for (const uri of uris) { try { UTSAndroid.getAppContext()!.getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e) {} }
+  }
+  const files: FileInfo[] = []
+  for (const uri of uris) {
+    const item = queryFileInfo(uri.toString())
+    if (item != null) files.push(item!)
+  }
+  if (files.length == 0) { fail(options, 9010005); return }
+  const result: ChooseFileResult = { files, cancelled: false }
+  options.success?.(result)
+  options.complete?.(result)
+}
+
+export const chooseFile = (options: ChooseFileOptions) : void => {
+  const activity = UTSAndroid.getUniActivity()
+  if (activity == null || pendingChoose != null) { fail(options, 9010002); return }
+  const intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+  intent.addCategory(Intent.CATEGORY_OPENABLE)
+  const types = options.mimeTypes ?? []
+  intent.setType(types.length == 1 ? types[0] : '*/*')
+  if (types.length > 1) intent.putExtra(Intent.EXTRA_MIME_TYPES, types.toTypedArray())
+  intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, options.multiple == true)
+  pendingChoose = options
+  UTSAndroid.onAppActivityResult(onActivityResult)
+  try { activity!.startActivityForResult(intent, REQUEST_CODE.toInt()) } catch (e) { pendingChoose = null; UTSAndroid.offAppActivityResult(onActivityResult); fail(options, 9010002) }
+}
+
+export const getFileInfo = (options: FileInfoOptions) : void => {
+  const info = queryFileInfo(options.uri)
+  if (info == null) { fail(options, 9010004); return }
+  options.success?.(info!)
+  options.complete?.(info!)
+}
+
+export const prepareFile = (options: PrepareFileOptions) : void => {
+  const info = copyToCache(options.uri)
+  if (info == null) { fail(options, 9010006); return }
+  options.success?.(info!)
+  options.complete?.(info!)
+}
+
+export const removeTempFile = (options: RemoveTempFileOptions) : void => {
+  const context = UTSAndroid.getAppContext()
+  if (context == null) { fail(options, 9010006); return }
+  try {
+    const cache = context!.getCacheDir().getCanonicalPath()
+    const target = File(options.path).getCanonicalFile()
+    // 对象字面量必须显式标注类型，否则编译为 UTSJSONObject 无法传给 RemoveTempFileResult 回调
+    if (!target.getPath().startsWith(cache + File.separator) || !target.exists()) { const result: RemoveTempFileResult = { removed: false }; options.success?.(result); options.complete?.(result); return }
+    const removed = target.delete()
+    const result: RemoveTempFileResult = { removed }
+    options.success?.(result)
+    options.complete?.(result)
+  } catch (e) { fail(options, 9010006) }
+}

@@ -1,0 +1,49 @@
+export type FileInfo = {
+  uri: string
+  name: string
+  size: number
+  mimeType: string
+  extension: string
+  path: string | null
+  isTemporary: boolean
+}
+export type ChooseFileOptions = {
+  mimeTypes?: string[]
+  multiple?: boolean
+  success?: (res: ChooseFileResult) => void
+  fail?: (err: FilePickerError) => void
+  complete?: (res: any) => void
+}
+export type ChooseFileResult = {
+  files: FileInfo[]
+  cancelled: boolean
+}
+export type RemoveTempFileResult = {
+  removed: boolean
+}
+export type FilePickerOptionsResult = {
+  files: FileInfo[]
+  cancelled: boolean
+}
+export type FileInfoOptions = {
+  uri: string
+  success?: (res: FileInfo) => void
+  fail?: (err: FilePickerError) => void
+  complete?: (res: any) => void
+}
+export type PrepareFileOptions = {
+  uri: string
+  success?: (res: FileInfo) => void
+  fail?: (err: FilePickerError) => void
+  complete?: (res: any) => void
+}
+export type RemoveTempFileOptions = {
+  path: string
+  success?: (res: RemoveTempFileResult) => void
+  fail?: (err: FilePickerError) => void
+  complete?: (res: any) => void
+}
+export type FilePickerErrorCode = 9010001 | 9010002 | 9010003 | 9010004 | 9010005 | 9010006 | 9010007 | 9010008
+export interface FilePickerError extends IUniError {
+  errCode: FilePickerErrorCode
+}
