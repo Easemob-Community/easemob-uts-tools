@@ -12,8 +12,8 @@ easemob-uts-tools/
 
 ## 插件列表
 
-| 插件 | 说明 | 平台 | 文档 |
-|---|---|---|---|
+| 插件                                                  | 说明                                                 | 平台                        | 文档                                               |
+| --------------------------------------------------- | -------------------------------------------------- | ------------------------- | ------------------------------------------------ |
 | [easemob-file-picker](packages/easemob-file-picker) | 系统文档选择器选文件、元数据查询、URI 复制为本地缓存副本（供 IM SDK 上传）、临时文件清理 | Android / iOS / HarmonyOS | [readme](packages/easemob-file-picker/readme.md) |
 
 ### easemob-file-picker 简介
@@ -45,9 +45,7 @@ ln -s ../../easemob-uts-tools/packages/easemob-file-picker easemob-file-picker
 
 ## 环境要求
 
-- HBuilderX >= 5.26
-- uni-app >= 3.1.0 / uni-app x >= 5.26.0
-- Android minSdk 24+ / iOS 16+ / HarmonyOS API 12+
+各插件的平台版本、HBuilderX / uni-app 版本要求不同，以**各插件 readme 的「平台要求」一节**为准。
 
 ## 新增插件约定
 
