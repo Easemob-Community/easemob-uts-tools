@@ -2,18 +2,26 @@
 	"id": "easemob-file-picker",
 	"displayName": "easemob-file-picker",
 	"version": "1.0.0",
-	"description": "easemob-file-picker",
+	"description": "跨平台文件选择器：封装系统文档选择器、元数据查询、URI 复制为本地缓存副本与临时文件清理，为环信 IM 发文件消息场景设计",
 	"keywords": [
-        "easemob-file-picker"
+        "文件选择",
+        "file-picker",
+        "UTS",
+        "环信",
+        "easemob"
     ],
-	"repository": "",
+	"repository": "github:Easemob-Community/easemob-uts-tools",
 	"engines": {
-		"HBuilderX": ">=5.26.0",
-		"uni-app": ">=3.1.0",
-		"uni-app-x": ">=5.26.0"
+		"HBuilderX": ">=4.71.0",
+		"uni-app": ">=4.71.0",
+		"uni-app-x": ">=4.71.0"
 	},
 	"dcloudext": {
 		"type": "uts",
+		"category": [
+			"前端组件",
+			"通用组件"
+		],
 		"sale": {
 			"regular": {
 				"price": "0.00"

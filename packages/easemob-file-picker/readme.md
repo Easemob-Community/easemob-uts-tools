@@ -23,7 +23,7 @@
 | iOS | 16 | `UIDocumentPickerViewController` + `UTType` | 无需 |
 | HarmonyOS Next | API 12+ | `@ohos.file.picker` | 无需 |
 
-开发环境：HBuilderX >= 5.26，uni-app >= 3.1.0 / uni-app x >= 5.26.0。
+开发环境：HBuilderX >= 4.71，uni-app >= 4.71.0 / uni-app x >= 4.71.0。
 
 ## 快速开始
 
