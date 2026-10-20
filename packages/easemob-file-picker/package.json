@@ -12,9 +12,9 @@
     ],
 	"repository": "github:Easemob-Community/easemob-uts-tools",
 	"engines": {
-		"HBuilderX": ">=4.71.0",
-		"uni-app": ">=4.71.0",
-		"uni-app-x": ">=4.71.0"
+		"HBuilderX": ">=5.26.0",
+		"uni-app": ">=3.1.0",
+		"uni-app-x": ">=5.26.0"
 	},
 	"dcloudext": {
 		"type": "uts",
