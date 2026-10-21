@@ -13,6 +13,9 @@ const fail = (options: ChooseFileOptions | FileInfoOptions | PrepareFileOptions 
   opt.complete?.(error)
 }
 
+// 选择进行中的并发守卫（chooseFile 专用）
+let picking = false
+
 const extensionOf = (name: string) : string => {
   const index = name.lastIndexOf('.')
   return index > 0 && index < name.length - 1 ? name.substring(index + 1).toLowerCase() : ''
@@ -101,11 +104,15 @@ const hasUnsupportedMimeType = (mimeTypes: string[] | null) : boolean => {
 }
 
 export const chooseFile = (options: ChooseFileOptions) : void => {
+  // 并发守卫：与 Android（pendingChoose）/ iOS（currentDelegate）行为对齐，重复调用返回 9010002
+  if (picking) { fail(options, 9010002); return }
   if (hasUnsupportedMimeType(options.mimeTypes ?? null)) { fail(options, 9010008); return }
+  picking = true
   try {
     const documentPicker = new picker.DocumentViewPicker(UTSHarmony.getUIAbilityContext())
     const selectOptions: picker.DocumentSelectOptions = { maxSelectNumber: options.multiple == true ? 50 : 1, fileSuffixFilters: getSuffixes(options.mimeTypes ?? null) }
     documentPicker.select(selectOptions).then((uris: string[]) => {
+      picking = false
       if (uris.length == 0) {
         const result: ChooseFileResult = { files: [], cancelled: true }
         options.success?.(result)
@@ -117,10 +124,13 @@ export const chooseFile = (options: ChooseFileOptions) : void => {
         const info = queryFileInfo(uri)
         if (info != null) files.push(info!)
       }
+      // 与 Android / iOS 对齐：选中文件全部读不到元数据时返回 9010005，而不是空 success
+      if (files.length == 0) { fail(options, 9010005); return }
       const result: ChooseFileResult = { files, cancelled: false }
       options.success?.(result)
       options.complete?.(result)
     }).catch((e: Error) => {
+      picking = false
       const message = e.message ?? ''
       if (message.toLowerCase().includes('cancel')) {
         const result: ChooseFileResult = { files: [], cancelled: true }
@@ -128,7 +138,7 @@ export const chooseFile = (options: ChooseFileOptions) : void => {
         options.complete?.(result)
       } else fail(options, 9010002)
     })
-  } catch (e) { fail(options, 9010002) }
+  } catch (e) { picking = false; fail(options, 9010002) }
 }
 
 export const getFileInfo = (options: FileInfoOptions) : void => {

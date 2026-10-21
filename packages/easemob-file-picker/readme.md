@@ -13,7 +13,7 @@
 - **零存储权限**：三端均走系统文档选择器（SAF / UIDocumentPicker / @ohos.file.picker），不申请任何存储权限，满足各平台隐私合规与上架审核要求
 - **三端统一**：同一套 TypeScript 调用代码，回调结构、错误码完全一致
 - **安全复制**：`prepareFile` 生成带随机名的缓存副本；HarmonyOS 端采用 fd 级复制，兼容 `file://docs/...` 跨沙箱 URI
-- **防误删**：`removeTempFile` 只删插件命名空间内的临时文件，越界路径返回 `removed: false` 而非报错
+- **防误删**：`removeTempFile` 只删应用缓存 / 临时目录内的文件，越界路径返回 `removed: false` 而非报错
 
 ## 平台要求
 
@@ -21,9 +21,9 @@
 |---|---|---|---|
 | Android | 7.0（minSdk 24） | SAF（`ACTION_OPEN_DOCUMENT`） | 无需 |
 | iOS | 16 | `UIDocumentPickerViewController` + `UTType` | 无需 |
-| HarmonyOS Next | API 12+ | `@ohos.file.picker` | 无需 |
+| HarmonyOS Next | API 14+ | `@ohos.file.picker` | 无需 |
 
-开发环境：HBuilderX >= 5.26，uni-app >= 3.1.0 / uni-app x >= 5.26.0。
+开发环境：HBuilderX >= 5.07（uni-app / uni-app x 同版本线）。已在 HBuilderX 5.07 与 5.26 完成 Android / iOS / HarmonyOS Next 三端真机验证。
 
 ## 快速开始
 
@@ -35,7 +35,7 @@
 import { chooseFile, prepareFile, removeTempFile } from '@/uni_modules/easemob-file-picker'
 
 chooseFile({
-  mimeTypes: ['image/*', 'application/pdf'],  // 不传或空数组 = 不限类型
+  mimeTypes: ['image/*', 'application/pdf'],  // 不传或空数组 = 不限类型（鸿蒙端限制见「平台行为说明」）
   multiple: false,
   success: (result) => {
     // 注意：用户取消是正常结果，走 success 且 cancelled = true
@@ -45,7 +45,8 @@ chooseFile({
       uri: result.files[0].uri,
       success: (file) => {
         // file.path 为本地缓存路径，可直接传给环信 SDK 发送文件消息
-        // 例：WebIM.message.create({ type: 'file', url: file.path, filename: file.name, ... })
+        // （以下为示意代码，字段以环信 SDK 文档为准）
+        // WebIM.message.create({ type: 'file', url: file.path, filename: file.name, ... })
 
         // 发送完成后清理临时文件
         removeTempFile({
@@ -84,11 +85,11 @@ getFileInfo({
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| mimeTypes | string[] | 否 | 限制可选 MIME 类型，如 `['application/pdf']`、`['image/*']`；不传或空数组表示不限 |
-| multiple | boolean | 否 | 是否多选，默认 false（多选上限 50） |
+| mimeTypes | string[] | 否 | 限制可选 MIME 类型，如 `['application/pdf']`、`['image/*']`；不传或空数组表示不限（鸿蒙端仅支持内置映射表中的类型，见「平台行为说明」） |
+| multiple | boolean | 否 | 是否多选，默认 false。仅 HarmonyOS 端限制最多 50 个；Android / iOS 不设插件层上限，由系统选择器决定 |
 | success | (res: ChooseFileResult) => void | 否 | 成功回调（**用户取消也走 success**） |
 | fail | (err: FilePickerError) => void | 否 | 失败回调 |
-| complete | (res: any) => void | 否 | 完成回调（成功失败都触发） |
+| complete | (res: any) => void | 否 | 完成回调（成功失败都触发，以下各 API 同） |
 
 `ChooseFileResult`：`{ files: FileInfo[], cancelled: boolean }`，取消时 `files` 为空数组。
 
@@ -105,7 +106,8 @@ getFileInfo({
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | path | string | 是 | `prepareFile` 返回的 `path` |
-| success | (res: { removed: boolean }) => void | 否 | 路径不在插件命名空间内时 `removed: false`，不报错 |
+| success | (res: { removed: boolean }) => void | 否 | 路径不在应用缓存 / 临时目录内时 `removed: false`，不报错 |
+| fail / complete | - | 否 | 同上 |
 
 ## FileInfo 结构
 
@@ -126,13 +128,13 @@ getFileInfo({
 | errCode | 说明 | 典型场景 |
 |---|---|---|
 | 9010001 | 文件选择失败 | 系统选择器返回异常 |
-| 9010002 | 无法打开文件选择器 | Activity 不可用、已有进行中的选择操作 |
+| 9010002 | 无法打开文件选择器 | Activity / 页面不可用、已有进行中的选择操作 |
 | 9010003 | 文件访问权限被拒 | 预留（系统 picker 模式下不会触发） |
-| 9010004 | URI 无效或不可用 | `getFileInfo` / `prepareFile` 的 URI 已失效 |
+| 9010004 | URI 无效或不可用 | `getFileInfo` 的 URI 已失效；iOS 端 `prepareFile` 的 URI 已失效 |
 | 9010005 | 文件元数据不可用 | 选中文件全部无法读取元数据 |
-| 9010006 | 无法读取或复制文件 | `prepareFile` 复制失败、IO 异常 |
+| 9010006 | 无法读取或复制文件 | `prepareFile` 复制失败、IO 异常；Android / 鸿蒙端 `prepareFile` 的 URI 失效也返回此码 |
 | 9010007 | 存储空间不足 | 预留 |
-| 9010008 | 当前平台不支持该操作 | Web / 小程序等平台调用 |
+| 9010008 | 当前平台不支持该操作 | Web / 小程序等平台调用；鸿蒙端传入了未在内置映射表中的具体 MIME 类型 |
 
 ## 平台行为说明
 
@@ -142,7 +144,7 @@ getFileInfo({
 - 自动对可持久化 URI 调用 `takePersistableUriPermission`，避免重启后 URI 失效
 
 **iOS**
-- MIME 通过 `UTType(mimeType:)` 映射；`image/*` 等通配映射到预置 UTType；全部未识别时回退为不限类型
+- MIME 通过 `UTType(mimeType:)` 映射；`image/*`、`video/*`、`audio/*`、`text/*` 通配映射到预置 UTType，未识别的类型回退为不限
 - 通过安全作用域资源（Security-Scoped Resource）访问选中文件
 - **选择回调内即完成沙箱复制**：picker 返回的是系统 File Provider Storage 暂存文件，选择结束且访问权释放后系统会回收，延迟重放 URI 不可靠。因此 iOS 端在选中时立即复制到沙箱 tmp 并内部注册，`prepareFile` 直接返回该副本（对外契约不变：`chooseFile` 仍只返回元数据）
 - **`success` 回调推迟到下一 main tick 触发**：可在 `success` 中直接同步调用 `prepareFile` 等其他插件 API，无需自行 setTimeout
@@ -152,13 +154,17 @@ getFileInfo({
 - 使用 `@ohos.file.picker` 的 DocumentViewPicker
 - picker 授予的临时读权限挂在 fd 上，`prepareFile` 内部采用 fd 级 `copyFileSync`，兼容 `file://docs/storage/...` 等跨应用公共目录 URI
 - 临时文件以 `easemob-file-` 前缀存放于应用 cacheDir
+- 同时只能进行一次选择操作，重复调用返回 9010002
+- **mimeTypes 仅支持内置映射表中的具体 MIME 类型**（pdf / txt / zip / json / office 文档 / 常见图片音视频等 18 种）；映射表外的具体 MIME 会直接返回 9010008
+- mimeTypes 中任一 `*/*` 或 `xxx/*` 通配符都会使整组过滤失效，展示全部文件（通配符无法映射为后缀过滤）
 
 ## 注意事项
 
 1. **用户取消不是错误**：取消走 `success` 且 `cancelled: true`，不要用 `fail` 判断取消
-2. **临时文件生命周期**：`prepareFile` 的副本由调用方通过 `removeTempFile` 清理；系统可能随时清缓存，不要长期持有 `path`
+2. **临时文件生命周期**：`prepareFile` 的副本由调用方通过 `removeTempFile` 清理（存放位置：Android 应用 cacheDir、iOS NSTemporaryDirectory、鸿蒙应用 cacheDir）；系统可能随时清缓存，不要长期持有 `path`
 3. **大文件复制**：`prepareFile` 为同步复制，大文件耗时较长，建议 UI 加 loading
 4. **Web / 小程序不支持**：仅支持 App 三端，其他平台调用返回 9010008
+5. **鸿蒙 MIME 限制**：`mimeTypes` 尽量使用内置映射表中的类型或通配符，详见「平台行为说明」
 
 ## 目录结构
 

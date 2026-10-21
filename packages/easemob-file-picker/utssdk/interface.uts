@@ -21,10 +21,6 @@ export type ChooseFileResult = {
 export type RemoveTempFileResult = {
   removed: boolean
 }
-export type FilePickerOptionsResult = {
-  files: FileInfo[]
-  cancelled: boolean
-}
 export type FileInfoOptions = {
   uri: string
   success?: (res: FileInfo) => void
