@@ -143,7 +143,9 @@ getFileInfo({
 
 **iOS**
 - MIME 通过 `UTType(mimeType:)` 映射；`image/*` 等通配映射到预置 UTType；全部未识别时回退为不限类型
-- 通过安全作用域资源（Security-Scoped Resource）访问选中文件，读完即释放
+- 通过安全作用域资源（Security-Scoped Resource）访问选中文件
+- **选择回调内即完成沙箱复制**：picker 返回的是系统 File Provider Storage 暂存文件，选择结束且访问权释放后系统会回收，延迟重放 URI 不可靠。因此 iOS 端在选中时立即复制到沙箱 tmp 并内部注册，`prepareFile` 直接返回该副本（对外契约不变：`chooseFile` 仍只返回元数据）
+- **`success` 回调推迟到下一 main tick 触发**：可在 `success` 中直接同步调用 `prepareFile` 等其他插件 API，无需自行 setTimeout
 - 同时只能进行一次选择操作，重复调用返回 9010002
 
 **HarmonyOS Next**

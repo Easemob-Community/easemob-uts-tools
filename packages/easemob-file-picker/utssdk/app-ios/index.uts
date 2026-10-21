@@ -58,6 +58,8 @@ const parseURL = (uri: string) : URL | null => {
 
 const queryFileInfo = (url: URL, uriText: string) : FileInfo | null => {
   const accessed = url.startAccessingSecurityScopedResource()
+  // 旧版 UTS→Swift 编译器（HBuilderX 4.75 及以前）不支持 finally，会把 finally 原样漏进生成的
+  // Swift 代码报 cannot find 'finally' in scope；改为在两条路径上分别清理，逻辑等价
   try {
     // resourceValues 对无效/不存在的文件会抛异常，兼作存在性检查，替代 fileExists（其双参数重载有桥接歧义）
     const values = UTSiOS.try(url.resourceValues(forKeys = [URLResourceKey.fileSizeKey, URLResourceKey.nameKey])) as URLResourceValues
@@ -66,11 +68,37 @@ const queryFileInfo = (url: URL, uriText: string) : FileInfo | null => {
     var name = values.name ?? url.lastPathComponent
     if (name.length == 0) name = 'file'
     const ext = extensionOf(name)
+    if (accessed) url.stopAccessingSecurityScopedResource()
     return { uri: uriText, name, size, mimeType: mimeForExtension(ext), extension: ext, path: null, isTemporary: false }
   } catch (e) {
-    return null
-  } finally {
     if (accessed) url.stopAccessingSecurityScopedResource()
+    return null
+  }
+}
+
+// iOS picker（asCopy=false）返回的是系统 File Provider Storage 暂存文件的安全作用域 URL，
+// 选择结束、访问权释放后系统会回收暂存文件，延迟重放 URI 不可靠（实测 resourceValues 抛错）。
+// 因此在选择回调里立即复制进沙箱，注册到 preparedFiles；prepareFile 命中注册表直接返回副本。
+let preparedFiles: FileInfo[] = []
+
+// 在选择回调上下文（访问权有效）内完成：读元数据 + 复制到沙箱临时目录
+const preparePickedFile = (url: URL) : FileInfo | null => {
+  const accessed = url.startAccessingSecurityScopedResource()
+  try {
+    const values = UTSiOS.try(url.resourceValues(forKeys = [URLResourceKey.fileSizeKey, URLResourceKey.nameKey])) as URLResourceValues
+    const size = new Number(values.fileSize ?? 0)
+    var name = values.name ?? url.lastPathComponent
+    if (name.length == 0) name = 'file'
+    const ext = extensionOf(name)
+    const suffix = ext.length > 0 ? '.' + ext : ''
+    const destPath = NSTemporaryDirectory() + new UUID().uuidString + suffix
+    UTSiOS.try(FileManager.default.copyItem(at = url, to = NSURL.fileURL(withPath = destPath)))
+    if (accessed) url.stopAccessingSecurityScopedResource()
+    return { uri: url.absoluteString, name, size, mimeType: mimeForExtension(ext), extension: ext, path: destPath, isTemporary: true }
+  } catch (e) {
+    console.log('[easemob-file-picker] preparePickedFile failed: ' + e.toString())
+    if (accessed) url.stopAccessingSecurityScopedResource()
+    return null
   }
 }
 
@@ -97,39 +125,59 @@ let currentDelegate: FilePickerDelegate | null = null
 
 export const chooseFile = (options: ChooseFileOptions) : void => {
   if (currentDelegate != null) { fail(options, 9010002); return }
-  // UTS 方法默认在子线程执行，UI 操作必须切主线程
-  DispatchQueue.main.async(execute = (): void => {
-    const controller = UTSiOS.getCurrentViewController()
-    if (controller == null) { fail(options, 9010002); return }
-    // UTS 桥接的是 forOpeningContentTypes:asCopy: 双参数初始化器，asCopy 必须显式传
-    // asCopy=false 保持与 Android 一致的语义：chooseFile 只取元数据，prepareFile 才复制
-    const picker = new UIDocumentPickerViewController(forOpeningContentTypes = contentTypesForMimes(options.mimeTypes ?? []), asCopy = false)
-    picker.allowsMultipleSelection = options.multiple == true
-    const delegate = new FilePickerDelegate(
-      (urls: URL[]) => {
-        currentDelegate = null
-        const files: FileInfo[] = []
-        for (const url of urls) {
-          const info = queryFileInfo(url, url.absoluteString)
-          if (info != null) files.push(info!)
-        }
-        if (files.length == 0) { fail(options, 9010005); return }
-        const result: ChooseFileResult = { files, cancelled: false }
-        options.success?.(result)
-        options.complete?.(result)
-      },
-      () => {
-        currentDelegate = null
-        const result: ChooseFileResult = { files: [], cancelled: true }
-        options.success?.(result)
-        options.complete?.(result)
+  // UTS 方法默认在子线程执行，UI 操作必须切主线程；
+  // 两层 try 把原生异常打到控制台（桥层对方法级异常只报 method call failed，看不到真实原因）
+  try {
+    DispatchQueue.main.async(execute = (): void => {
+      try {
+        const controller = UTSiOS.getCurrentViewController()
+        if (controller == null) { fail(options, 9010002); return }
+        // UTS 桥接的是 forOpeningContentTypes:asCopy: 双参数初始化器，asCopy 必须显式传
+        // asCopy=false 保持与 Android 一致的语义：chooseFile 只取元数据，prepareFile 才复制
+        const picker = new UIDocumentPickerViewController(forOpeningContentTypes = contentTypesForMimes(options.mimeTypes ?? []), asCopy = false)
+        picker.allowsMultipleSelection = options.multiple == true
+        const delegate = new FilePickerDelegate(
+          (urls: URL[]) => {
+            currentDelegate = null
+            const files: FileInfo[] = []
+            for (const url of urls) {
+              const prepared = preparePickedFile(url)
+              if (prepared != null) {
+                preparedFiles.push(prepared!)
+                // 保持三端一致的契约：chooseFile 只交付元数据（path=null），沙箱副本由 prepareFile 交付
+                files.push({ uri: prepared!.uri, name: prepared!.name, size: prepared!.size, mimeType: prepared!.mimeType, extension: prepared!.extension, path: null, isTemporary: false })
+              }
+            }
+            if (files.length == 0) { fail(options, 9010005); return }
+            const result: ChooseFileResult = { files, cancelled: false }
+            // iOS 桥层会在「原生→JS 回调栈」里吞掉 JS→原生的同步重入调用（5.07 实测：
+            // 业务在 success 里同步调 prepareFile 无任何输出、回调不触发）。
+            // 推迟到下一个 main tick 再回调，保证业务侧可在 success 中直接调用其他插件 API
+            DispatchQueue.main.async(execute = (): void => {
+              options.success?.(result)
+              options.complete?.(result)
+            })
+          },
+          () => {
+            currentDelegate = null
+            const result: ChooseFileResult = { files: [], cancelled: true }
+            options.success?.(result)
+            options.complete?.(result)
+          }
+        )
+        // picker.delegate 是弱引用，必须用模块级变量持有，否则回调会丢失
+        currentDelegate = delegate
+        picker.delegate = delegate
+        controller.present(picker, animated = true)
+      } catch (e) {
+        console.log('[easemob-file-picker] chooseFile inner exception: ' + e.toString())
+        fail(options, 9010002)
       }
-    )
-    // picker.delegate 是弱引用，必须用模块级变量持有，否则回调会丢失
-    currentDelegate = delegate
-    picker.delegate = delegate
-    controller.present(picker, animated = true)
-  })
+    })
+  } catch (e) {
+    console.log('[easemob-file-picker] chooseFile dispatch exception: ' + e.toString())
+    fail(options, 9010002)
+  }
 }
 
 export const getFileInfo = (options: FileInfoOptions) : void => {
@@ -142,6 +190,15 @@ export const getFileInfo = (options: FileInfoOptions) : void => {
 }
 
 export const prepareFile = (options: PrepareFileOptions) : void => {
+  // 优先命中注册表：chooseFile 选择回调里已复制好的沙箱副本
+  for (const prepared of preparedFiles) {
+    if (prepared.uri == options.uri) {
+      options.success?.(prepared)
+      options.complete?.(prepared)
+      return
+    }
+  }
+  // 未命中：非 picker 来源的 URI（如沙箱内 file:// 路径），走直接复制流程
   const url = parseURL(options.uri)
   if (url == null) { fail(options, 9010004); return }
   const source = url!
@@ -150,14 +207,16 @@ export const prepareFile = (options: PrepareFileOptions) : void => {
   const suffix = metadata!.extension.length > 0 ? '.' + metadata!.extension : ''
   const destPath = NSTemporaryDirectory() + new UUID().uuidString + suffix
   const accessed = source.startAccessingSecurityScopedResource()
+  // 同 queryFileInfo：不用 finally，两条路径分别释放安全作用域资源
   try {
     UTSiOS.try(FileManager.default.copyItem(at = source, to = NSURL.fileURL(withPath = destPath)))
   } catch (e) {
+    console.log('[easemob-file-picker] prepareFile copyItem failed: ' + e.toString())
+    if (accessed) source.stopAccessingSecurityScopedResource()
     fail(options, 9010006)
     return
-  } finally {
-    if (accessed) source.stopAccessingSecurityScopedResource()
   }
+  if (accessed) source.stopAccessingSecurityScopedResource()
   const result: FileInfo = { uri: options.uri, name: metadata!.name, size: metadata!.size, mimeType: metadata!.mimeType, extension: metadata!.extension, path: destPath, isTemporary: true }
   options.success?.(result)
   options.complete?.(result)
@@ -173,6 +232,13 @@ export const removeTempFile = (options: RemoveTempFileOptions) : void => {
   }
   try {
     UTSiOS.try(FileManager.default.removeItem(atPath = options.path))
+    // 同步清掉 chooseFile 注册表里的对应条目，避免内存膨胀。
+    // 不用 findIndex/splice 等高阶数组方法（闭包桥接在 Swift 侧有歧义），重建数组最稳
+    const remaining: FileInfo[] = []
+    for (const f of preparedFiles) {
+      if (f.path != options.path) remaining.push(f)
+    }
+    preparedFiles = remaining
     const result: RemoveTempFileResult = { removed: true }
     options.success?.(result)
     options.complete?.(result)

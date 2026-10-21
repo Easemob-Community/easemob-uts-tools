@@ -89,10 +89,19 @@ const copyToCache = (uriText: string) : FileInfo | null => {
   }
 }
 
-// 显式标注函数类型：闭包内引用自身（offAppActivityResult）会导致 Kotlin 类型推断递归
+// 旧版 Kotlin 编译器（HBuilderX 4.75 及以前）两头受限：
+// ① 顶层 val 不允许在自身初始化器中自引用（报 Variable must be initialized）
+// ② 函数声明不能当值传递（报 Function invocation expected，新版才会自动生成 :: 函数引用）
+// 因此注册一个稳定的转发回调 onActivityResult（不自引用、可安全传递），
+// 真实逻辑挂在可按次替换的 resultHandler 上，chooseFile 每次调用前重挂
+let resultHandler: (requestCode: number, resultCode: number, data: Intent | null) => void = (requestCode: number, resultCode: number, data: Intent | null) : void => {}
+
 const onActivityResult: (requestCode: number, resultCode: number, data: Intent | null) => void = (requestCode: number, resultCode: number, data: Intent | null) : void => {
-  if (requestCode != REQUEST_CODE || pendingChoose == null) return
-  const options = pendingChoose!
+  resultHandler(requestCode, resultCode, data)
+}
+
+const handleActivityResult = (options: ChooseFileOptions, requestCode: number, resultCode: number, data: Intent | null) : void => {
+  if (requestCode != REQUEST_CODE) return
   pendingChoose = null
   UTSAndroid.offAppActivityResult(onActivityResult)
   if (resultCode != Activity.RESULT_OK || data == null) {
@@ -134,6 +143,7 @@ export const chooseFile = (options: ChooseFileOptions) : void => {
   if (types.length > 1) intent.putExtra(Intent.EXTRA_MIME_TYPES, types.toTypedArray())
   intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, options.multiple == true)
   pendingChoose = options
+  resultHandler = (requestCode: number, resultCode: number, data: Intent | null) : void => { handleActivityResult(options, requestCode, resultCode, data) }
   UTSAndroid.onAppActivityResult(onActivityResult)
   try { activity!.startActivityForResult(intent, REQUEST_CODE.toInt()) } catch (e) { pendingChoose = null; UTSAndroid.offAppActivityResult(onActivityResult); fail(options, 9010002) }
 }
