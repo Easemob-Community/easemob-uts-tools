@@ -59,7 +59,7 @@
 						"chrome": "x"
 					},
 					"app": {
-						"vue": "-",
+						"vue": "√",
 						"nvue": "-",
 						"android": "√",
 						"ios": "√",

@@ -1,20 +1,33 @@
-import { ChooseFileOptions, ChooseFileResult, FileInfo, FileInfoOptions, FilePickerErrorCode, PrepareFileOptions, RemoveTempFileOptions, RemoveTempFileResult } from '../interface.uts'
+import { ChooseFileOptions, ChooseFileResult, FileInfo, FileInfoOptions, FilePickerError, FilePickerErrorCode, PrepareFileOptions, RemoveTempFileOptions, RemoveTempFileResult } from '../interface.uts'
 import { FilePickerErrorImpl } from '../unierror'
 import picker from '@ohos.file.picker'
 import fs from '@ohos.file.fs'
 import uriModule from '@ohos.uri'
+import { BusinessError } from '@ohos.base'
 // UTSHarmony 是 uni-app x 鸿蒙端的全局对象，无需 import；import 'io.dcloud.uts' 会解析失败
 
-const fail = (options: ChooseFileOptions | FileInfoOptions | PrepareFileOptions | RemoveTempFileOptions, code: FilePickerErrorCode) : void => {
+// 统一失败出口：只接收具体回调，不接收整个 options。
+// 早期写法是传联合类型 options 再 `as ChooseFileOptions`——ArkTS 里 as 是编译期擦除，
+// 碰巧能跑，但类型契约是错的，且与 iOS/Android 的强制转换语义不一致。改为各调用点直取回调。
+const notifyFail = (
+  onFail: ((err: FilePickerError) => void) | null,
+  onComplete: ((res: any) => void) | null,
+  code: FilePickerErrorCode
+) : void => {
   const error = new FilePickerErrorImpl(code)
-  // UTS 联合类型编译后无法直接访问成员（iOS 端已验证会编译失败），先断言为具体类型
-  const opt = options as ChooseFileOptions
-  opt.fail?.(error)
-  opt.complete?.(error)
+  onFail?.(error)
+  onComplete?.(error)
 }
+
+// picker 用户取消时 reject 的错误码（BusinessError.code）。
+// 不能用 message 文本判断：message 是系统本地化文案，中文环境为「用户取消操作」，不含 cancel
+const PICKER_CANCEL_CODE = 13900042
 
 // 选择进行中的并发守卫（chooseFile 专用）
 let picking = false
+
+// 临时文件名序号：Date.now() 同毫秒内多次生成也不会重名
+let tempFileSeq = 0
 
 const extensionOf = (name: string) : string => {
   const index = name.lastIndexOf('.')
@@ -34,8 +47,11 @@ const extensionsForMime = (mime: string) : string[] => {
 }
 
 const nameFromUri = (uri: string) : string => {
-  const encodedName = new uriModule.URI(uri).toString().split('/').pop() ?? 'file'
-  try { return decodeURIComponent(encodedName) } catch (e) { return encodedName }
+  const encodedName = new uriModule.URI(uri).toString().split('/').pop() ?? ''
+  var name = encodedName
+  try { name = decodeURIComponent(encodedName) } catch (e) { name = encodedName }
+  // URI 以 / 结尾或解码失败时兜底，避免 FileInfo.name 为空（与 iOS/Android 的 'file' 兜底一致）
+  return name.length == 0 ? 'file' : name
 }
 
 const queryFileInfo = (uri: string) : FileInfo | null => {
@@ -46,9 +62,16 @@ const queryFileInfo = (uri: string) : FileInfo | null => {
     try { stat = fs.statSync(descriptor.fd) } finally { fs.closeSync(descriptor) }
     const name = nameFromUri(uri)
     const extension = extensionOf(name)
+    // getMimeTypeFromExtension 在鸿蒙 SDK 里的返回类型是 string | null（查不到就是 null），
+    // 必须兜底成空串，否则既无法赋给 FileInfo.mimeType(string)，也与 iOS/Android 端契约不一致
+    const mime = UTSHarmony.getMimeTypeFromExtension(extension) ?? ''
     // ArkTS 的 number 没有 toDouble()，Stat.size 本身就是 number
-    return { uri, name, size: stat!.size, mimeType: UTSHarmony.getMimeTypeFromExtension(extension), extension, path: null, isTemporary: false }
-  } catch (e) { return null }
+    const info: FileInfo = { uri, name, size: stat!.size, mimeType: mime, extension, path: null, isTemporary: false }
+    return info
+  } catch (e) {
+    console.log('[easemob-file-picker] queryFileInfo failed: ' + uri)
+    return null
+  }
 }
 
 const temporaryPath = (name: string) : string => {
@@ -56,16 +79,20 @@ const temporaryPath = (name: string) : string => {
   const cacheDir = context.cacheDir
   const safeExtension = extensionOf(name)
   const suffix = safeExtension.length > 0 ? '.' + safeExtension : ''
-  return cacheDir + '/easemob-file-' + Date.now().toString() + '-' + Math.floor(Math.random() * 1000000).toString() + suffix
+  // 统一走 easemob-file- 前缀（removeTempFile 按此前缀校验），序号保证同毫秒内不重名
+  tempFileSeq = tempFileSeq + 1
+  return cacheDir + '/easemob-file-' + Date.now().toString() + '-' + tempFileSeq.toString() + suffix
 }
 
 const copyToCache = (uri: string) : FileInfo | null => {
   const metadata = queryFileInfo(uri)
   if (metadata == null) return null
-  const target = temporaryPath(metadata!.name)
+  let target = ''
   let sourceFd = -1
   let targetFd = -1
   try {
+    // temporaryPath 内部要取 UIAbilityContext，放进 try 里，取不到时按复制失败处理而不是抛到插件外
+    target = temporaryPath(metadata!.name)
     // picker 授予的临时读权限挂在 fd 上：直接用 URI 调 copyFileSync 会因
     // URI→沙箱路径转换失败而抛错（如 file://docs/storage/Users/... 其他应用公共目录），
     // 必须先 openSync 拿 fd，再走 fd 级 copyFileSync
@@ -75,13 +102,17 @@ const copyToCache = (uri: string) : FileInfo | null => {
     targetFd = dest.fd
     fs.copyFileSync(sourceFd, targetFd)
     const copied = fs.statSync(targetFd)
-    return { uri, name: metadata!.name, size: copied.size, mimeType: metadata!.mimeType, extension: metadata!.extension, path: target, isTemporary: true }
+    const info: FileInfo = { uri, name: metadata!.name, size: copied.size, mimeType: metadata!.mimeType, extension: metadata!.extension, path: target, isTemporary: true }
+    return info
   } catch (e) {
-    try { fs.unlinkSync(target) } catch (cleanupError) {}
+    console.log('[easemob-file-picker] copyToCache failed: ' + e.toString())
+    if (target.length > 0) {
+      try { fs.unlinkSync(target) } catch (cleanupError) { console.log('[easemob-file-picker] cleanup failed: ' + target) }
+    }
     return null
   } finally {
-    if (sourceFd >= 0) { try { fs.closeSync(sourceFd) } catch (closeError) {} }
-    if (targetFd >= 0) { try { fs.closeSync(targetFd) } catch (closeError) {} }
+    if (sourceFd >= 0) { try { fs.closeSync(sourceFd) } catch (closeError) { console.log('[easemob-file-picker] close source fd failed') } }
+    if (targetFd >= 0) { try { fs.closeSync(targetFd) } catch (closeError) { console.log('[easemob-file-picker] close target fd failed') } }
   }
 }
 
@@ -89,24 +120,22 @@ const getSuffixes = (mimeTypes: string[] | null) : string[] => {
   if (mimeTypes == null || mimeTypes!.length == 0) return []
   const extensions: string[] = []
   for (const mime of mimeTypes!) {
+    // 通配符无法映射成后缀过滤，直接放弃过滤（整组退化为不限，与 iOS 的父类型退化等价）
     if (mime == '*/*' || mime.endsWith('/*')) return []
-    extensions.push(...extensionsForMime(mime))
+    const mapped = extensionsForMime(mime)
+    // 与 iOS 对齐：映射表外的具体 MIME 忽略并告警，不阻断选择（全都不识别时同样退化为不限）
+    if (mapped.length == 0) {
+      console.log('[easemob-file-picker] unsupported mimeType ignored: ' + mime)
+    } else {
+      extensions.push(...mapped)
+    }
   }
   return extensions
 }
 
-const hasUnsupportedMimeType = (mimeTypes: string[] | null) : boolean => {
-  if (mimeTypes == null || mimeTypes!.length == 0) return false
-  for (const mime of mimeTypes!) {
-    if (mime != '*/*' && !mime.endsWith('/*') && extensionsForMime(mime).length == 0) return true
-  }
-  return false
-}
-
 export const chooseFile = (options: ChooseFileOptions) : void => {
   // 并发守卫：与 Android（pendingChoose）/ iOS（currentDelegate）行为对齐，重复调用返回 9010002
-  if (picking) { fail(options, 9010002); return }
-  if (hasUnsupportedMimeType(options.mimeTypes ?? null)) { fail(options, 9010008); return }
+  if (picking) { notifyFail(options.fail, options.complete, 9010002); return }
   picking = true
   try {
     const documentPicker = new picker.DocumentViewPicker(UTSHarmony.getUIAbilityContext())
@@ -125,46 +154,56 @@ export const chooseFile = (options: ChooseFileOptions) : void => {
         if (info != null) files.push(info!)
       }
       // 与 Android / iOS 对齐：选中文件全部读不到元数据时返回 9010005，而不是空 success
-      if (files.length == 0) { fail(options, 9010005); return }
+      if (files.length == 0) { notifyFail(options.fail, options.complete, 9010005); return }
       const result: ChooseFileResult = { files, cancelled: false }
       options.success?.(result)
       options.complete?.(result)
     }).catch((e: Error) => {
       picking = false
-      const message = e.message ?? ''
-      if (message.toLowerCase().includes('cancel')) {
+      const err = e as BusinessError
+      // 取消优先按错误码判断，message 只作兜底（本地化文案不可靠）
+      if (err.code == PICKER_CANCEL_CODE || e.message.toLowerCase().indexOf('cancel') >= 0) {
         const result: ChooseFileResult = { files: [], cancelled: true }
         options.success?.(result)
         options.complete?.(result)
-      } else fail(options, 9010002)
+      } else {
+        console.log('[easemob-file-picker] picker reject code=' + err.code.toString() + ' msg=' + e.message)
+        notifyFail(options.fail, options.complete, 9010002)
+      }
     })
-  } catch (e) { picking = false; fail(options, 9010002) }
+  } catch (e) { picking = false; notifyFail(options.fail, options.complete, 9010002) }
 }
 
 export const getFileInfo = (options: FileInfoOptions) : void => {
   const info = queryFileInfo(options.uri)
-  if (info == null) { fail(options, 9010004); return }
+  if (info == null) { notifyFail(options.fail, options.complete, 9010004); return }
   options.success?.(info!)
   options.complete?.(info!)
 }
 
 export const prepareFile = (options: PrepareFileOptions) : void => {
   const info = copyToCache(options.uri)
-  if (info == null) { fail(options, 9010006); return }
+  if (info == null) { notifyFail(options.fail, options.complete, 9010006); return }
   options.success?.(info!)
   options.complete?.(info!)
 }
 
 export const removeTempFile = (options: RemoveTempFileOptions) : void => {
   const context = UTSHarmony.getUIAbilityContext()
-  if (context == null) { fail(options, 9010006); return }
+  if (context == null) { notifyFail(options.fail, options.complete, 9010006); return }
   const cachePrefix = context!.cacheDir + '/easemob-file-'
-  // ArkTS 不支持结构类型推断，对象字面量必须显式标注类型，否则编译成 UTSJSONObject 报错
-  if (!options.path.startsWith(cachePrefix)) { const result: RemoveTempFileResult = { removed: false }; options.success?.(result); options.complete?.(result); return }
+  // ArkTS 不支持结构类型推断，对象字面量必须显式标注类型，否则编译成 UTSJSONObject 报错。
+  // 前缀校验外再挡一层 `..`：cache/../ 之类的路径同样能通过 startsWith 检查
+  if (!options.path.startsWith(cachePrefix) || options.path.indexOf('..') >= 0) { const result: RemoveTempFileResult = { removed: false }; options.success?.(result); options.complete?.(result); return }
   try {
     fs.unlinkSync(options.path)
     const result: RemoveTempFileResult = { removed: true }
     options.success?.(result)
     options.complete?.(result)
-  } catch (e) { const result: RemoveTempFileResult = { removed: false }; options.success?.(result); options.complete?.(result) }
+  } catch (e) {
+    console.log('[easemob-file-picker] unlinkSync failed: ' + e.toString())
+    const result: RemoveTempFileResult = { removed: false }
+    options.success?.(result)
+    options.complete?.(result)
+  }
 }
